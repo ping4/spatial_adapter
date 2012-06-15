@@ -47,7 +47,9 @@ module ActiveRecord::ConnectionAdapters
     def columns(table_name, name = nil) #:nodoc:
       raw_geom_infos = column_spatial_info(table_name)
 
-      column_definitions(table_name).collect do |name, type, default, notnull|
+      cdef = column_definitions(table_name)
+      cdef = cdef.collect(&:values) if cdef.size > 0 && cdef.first.is_a?(Hash)
+      cdef.collect do |name, type, default, notnull|
         case type
         when /geography/i
           ActiveRecord::ConnectionAdapters::SpatialPostgreSQLColumn.create_from_geography(name, default, type, notnull == 'f')
@@ -149,10 +151,9 @@ module ActiveRecord::ConnectionAdapters
     # This is a full replacement for the ActiveRecord method and as a result
     # has a higher probability of breaking in future releases.
     def indexes(table_name, name = nil)
-       schemas = schema_search_path.split(/,/).map { |p| quote(p) }.join(',')
-
+       schemas = @config[:schema_search_path] || select_rows('SHOW search_path')[0][0]
        # Changed from upstread: link to pg_am to grab the index type (e.g. "gist")
-       result = query(<<-SQL, name)
+       result = select_rows(<<-SQL, name)
          SELECT distinct i.relname, d.indisunique, d.indkey, t.oid, am.amname
            FROM pg_class t, pg_class i, pg_index d, pg_attribute a, pg_am am
          WHERE i.relkind = 'i'
@@ -177,7 +178,7 @@ module ActiveRecord::ConnectionAdapters
         indtype = row[4]
 
         # Changed from upstream: need to get the column types to test for spatial indexes
-        columns = query(<<-SQL, "Columns for index #{row[0]} on #{table_name}").inject({}) {|attlist, r| attlist[r[1]] = [r[0], r[2]]; attlist}
+        columns = select_rows(<<-SQL, "Columns for index #{row[0]} on #{table_name}").inject({}) {|attlist, r| attlist[r[1]] = [r[0], r[2]]; attlist}
         SELECT a.attname, a.attnum, t.typname
         FROM pg_attribute a, pg_type t
         WHERE a.attrelid = #{oid}
@@ -188,7 +189,10 @@ module ActiveRecord::ConnectionAdapters
         # Only GiST indexes on spatial columns denote a spatial index
         spatial = indtype == 'gist' && columns.size == 1 && (columns.values.first[1] == 'geometry' || columns.values.first[1] == 'geography')
 
-        column_names = indkey.map {|attnum| columns[attnum] ? columns[attnum][0] : nil }
+        column_names = indkey.map do |attnum|
+          attnum = attnum.to_i
+          columns[attnum] ? columns[attnum][0] : nil
+        end
         ActiveRecord::ConnectionAdapters::IndexDefinition.new(table_name, index_name, unique, column_names, spatial)
       end
 
@@ -213,7 +217,7 @@ module ActiveRecord::ConnectionAdapters
     end
 
     def column_spatial_info(table_name)
-      constr = query("SELECT * FROM geometry_columns WHERE f_table_name = '#{table_name}'")
+      constr = select_rows("SELECT * FROM geometry_columns WHERE f_table_name = '#{table_name}'")
 
       raw_geom_infos = {}
       constr.each do |constr_def_a|
